@@ -438,6 +438,38 @@ fn apply_libkrun_patch(src_dir: &Path, manifest_dir: &Path) {
     fs::write(&patch_marker, "applied").ok();
 }
 
+/// Sets LIBCLANG_PATH if not already set and llvm-config is not in PATH.
+/// This is needed for bindgen to find libclang when building libkrun.
+#[cfg(target_os = "macos")]
+fn setup_libclang_path() {
+    // Skip if LIBCLANG_PATH is already set
+    if env::var("LIBCLANG_PATH").is_ok() {
+        return;
+    }
+
+    // Skip if llvm-config is in PATH (bindgen will find libclang automatically)
+    if Command::new("llvm-config")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return;
+    }
+
+    // Try to find brew's llvm
+    if let Ok(output) = Command::new("brew").args(["--prefix", "llvm"]).output() {
+        if output.status.success() {
+            let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let lib_path = format!("{}/lib", prefix);
+            if Path::new(&lib_path).join("libclang.dylib").exists() {
+                env::set_var("LIBCLANG_PATH", &lib_path);
+            }
+        }
+    }
+}
+
 /// Builds libkrun from vendored source with cross-compilation support.
 #[cfg(target_os = "macos")]
 fn build_libkrun_macos(
@@ -446,6 +478,9 @@ fn build_libkrun_macos(
     libkrunfw_install: &Path,
     manifest_dir: &Path,
 ) {
+    // Setup LIBCLANG_PATH for bindgen if needed
+    setup_libclang_path();
+
     // Apply cross-compilation patch from vendored patch file
     apply_libkrun_patch(src_dir, manifest_dir);
 
