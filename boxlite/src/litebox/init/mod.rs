@@ -31,7 +31,7 @@
 mod tasks;
 mod types;
 
-pub(crate) use crate::litebox::inner::BoxInner;
+pub(crate) use crate::litebox::box_impl::LiveState;
 
 use crate::litebox::BoxStatus;
 use crate::litebox::config::BoxConfig;
@@ -39,12 +39,11 @@ use crate::metrics::BoxMetricsStorage;
 use crate::pipeline::{
     BoxedTask, ExecutionPlan, PipelineBuilder, PipelineExecutor, PipelineMetrics, Stage,
 };
-use crate::runtime::guest_rootfs::GuestRootfs;
-use crate::runtime::rt_impl::RuntimeInner;
-use crate::runtime::types::{BoxState, ContainerId};
+use crate::runtime::rt_impl::SharedRuntimeImpl;
+use crate::runtime::types::BoxState;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use std::sync::Arc;
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::Mutex;
 
 use tasks::{
     ContainerRootfsTask, FilesystemTask, GuestConnectTask, GuestInitTask, GuestRootfsTask, InitCtx,
@@ -136,7 +135,7 @@ fn box_metrics_from_pipeline(pipeline_metrics: &PipelineMetrics) -> BoxMetricsSt
 ///     .await?;
 /// ```
 pub(crate) struct BoxBuilder {
-    runtime: RuntimeInner,
+    runtime: SharedRuntimeImpl,
     config: BoxConfig,
     state: BoxState,
 }
@@ -154,7 +153,7 @@ impl BoxBuilder {
     /// * `config` - Box configuration (immutable after creation)
     /// * `state` - Current box state (determines init mode)
     pub(crate) fn new(
-        runtime: RuntimeInner,
+        runtime: SharedRuntimeImpl,
         config: BoxConfig,
         state: BoxState,
     ) -> BoxliteResult<Self> {
@@ -169,10 +168,11 @@ impl BoxBuilder {
         })
     }
 
-    /// Build and initialize the box.
+    /// Build and initialize LiveState.
     ///
     /// Executes all initialization stages with automatic cleanup on failure.
-    pub(crate) async fn build(self) -> BoxliteResult<BoxInner> {
+    /// Returns LiveState which will be set in BoxImpl.
+    pub(crate) async fn build(self) -> BoxliteResult<LiveState> {
         use std::time::Instant;
 
         let total_start = Instant::now();
@@ -184,21 +184,10 @@ impl BoxBuilder {
         } = self;
 
         let status = state.status;
+        let reuse_rootfs = status == BoxStatus::Stopped;
+        let skip_guest_wait = status == BoxStatus::Running;
 
-        let container_id = ContainerId::new();
-        tracing::debug!(container_id = %container_id.short(), "Generated container ID");
-
-        let home_dir = runtime.layout.home_dir().to_path_buf();
-        let guest_rootfs_cell: Arc<OnceCell<GuestRootfs>> = Arc::clone(&runtime.guest_rootfs);
-
-        let ctx = InitPipelineContext::new(
-            config,
-            state,
-            home_dir,
-            runtime,
-            guest_rootfs_cell,
-            container_id,
-        );
+        let ctx = InitPipelineContext::new(config, runtime.clone(), reuse_rootfs, skip_guest_wait);
         let ctx = Arc::new(Mutex::new(ctx));
 
         if status != BoxStatus::Starting {
@@ -219,47 +208,48 @@ impl BoxBuilder {
 
         let mut metrics = box_metrics_from_pipeline(&pipeline_metrics);
         metrics.set_total_create_duration(total_create_duration_ms);
-        // Note: guest_boot_duration is now logged in ShimController::start(),
-        // but not tracked in BoxMetrics since handler doesn't store timing metadata
 
         metrics.log_init_stages();
 
         ctx.guard.disarm();
 
-        // Get guest_output from GuestInitTask (runs for both Starting and Stopped)
-        // Reattach (Running) uses a different path and doesn't call build()
-        let guest_output = ctx
-            .guest_output
+        // Get guest_session from GuestConnectTask
+        let guest_session = ctx
+            .guest_session
             .take()
-            .ok_or_else(|| BoxliteError::Internal("guest_init task must run first".into()))?;
+            .ok_or_else(|| BoxliteError::Internal("guest_connect task must run first".into()))?;
 
-        // Update container_id in database
-        let _ = ctx
-            .runtime
-            .box_manager
-            .update_container_id(&ctx.config.id, guest_output.container_id.clone());
+        // Get disks from context (for Running, create disk reference directly)
+        let (container_disk, guest_disk) = if status == BoxStatus::Running {
+            // Reattach: create disk reference to existing qcow2
+            use crate::disk::DiskFormat;
+            let disk = crate::disk::Disk::new(
+                ctx.config.box_home.join("root.qcow2"),
+                DiskFormat::Qcow2,
+                true,
+            );
+            (disk, None)
+        } else {
+            // Starting/Stopped: get disks from rootfs tasks
+            let container_disk = ctx
+                .container_disk
+                .take()
+                .ok_or_else(|| BoxliteError::Internal("rootfs task must run first".into()))?;
+            (container_disk, ctx.guest_disk.take())
+        };
 
-        let fs_output = ctx
-            .fs_output
-            .take()
-            .ok_or_else(|| BoxliteError::Internal("filesystem task must run first".into()))?;
-        let config_output = ctx
-            .config_output
-            .take()
-            .ok_or_else(|| BoxliteError::Internal("vmm_config task must run first".into()))?;
+        #[cfg(target_os = "linux")]
+        let bind_mount = ctx.bind_mount.take();
 
-        let box_home = fs_output.layout.root().to_path_buf();
-
-        Ok(BoxInner {
-            box_home,
-            handler: std::sync::Mutex::new(handler),
-            guest_session: guest_output.guest_session,
+        // Build LiveState
+        Ok(LiveState::new(
+            handler,
+            guest_session,
             metrics,
-            _container_rootfs_disk: config_output.disk,
-            guest_rootfs_disk: config_output.init_disk,
-            container_id: guest_output.container_id,
+            container_disk,
+            guest_disk,
             #[cfg(target_os = "linux")]
-            bind_mount: fs_output.bind_mount,
-        })
+            bind_mount,
+        ))
     }
 }

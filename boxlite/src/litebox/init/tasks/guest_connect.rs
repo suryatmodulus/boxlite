@@ -9,6 +9,7 @@ use super::{InitCtx, log_task_error, task_start};
 use crate::pipeline::PipelineTask;
 use crate::portal::GuestSession;
 use async_trait::async_trait;
+use boxlite_shared::Transport;
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use std::time::Duration;
 
@@ -20,23 +21,25 @@ impl PipelineTask<InitCtx> for GuestConnectTask {
         let task_name = self.name();
         let box_id = task_start(&ctx, task_name).await;
 
-        let (transport, ready_transport) = {
+        let (transport, ready_transport, skip_guest_wait) = {
             let ctx = ctx.lock().await;
-            let config_output = ctx
-                .config_output
-                .as_ref()
-                .expect("config_output must be set before guest_connect");
             (
                 ctx.config.transport.clone(),
-                config_output.box_config.ready_transport.clone(),
+                Transport::unix(ctx.config.ready_socket_path.clone()),
+                ctx.skip_guest_wait,
             )
         };
 
         // Wait for guest to be ready before creating session
-        tracing::debug!(box_id = %box_id, "Waiting for guest to be ready");
-        wait_for_guest_ready(&ready_transport)
-            .await
-            .inspect_err(|e| log_task_error(&box_id, task_name, e))?;
+        // Skip for reattach (Running status) - guest already signaled ready at boot
+        if skip_guest_wait {
+            tracing::debug!(box_id = %box_id, "Skipping guest ready wait (reattach)");
+        } else {
+            tracing::debug!(box_id = %box_id, "Waiting for guest to be ready");
+            wait_for_guest_ready(&ready_transport)
+                .await
+                .inspect_err(|e| log_task_error(&box_id, task_name, e))?;
+        }
 
         tracing::debug!(box_id = %box_id, "Guest is ready, creating session");
         let guest_session = GuestSession::new(transport);

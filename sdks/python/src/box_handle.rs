@@ -20,13 +20,12 @@ impl PyBox {
     }
 
     #[getter]
-    fn name(&self) -> PyResult<Option<String>> {
-        Ok(self.handle.name().map(|s| s.to_string()))
+    fn name(&self) -> Option<String> {
+        self.handle.name().map(|s| s.to_string())
     }
 
-    fn info(&self) -> PyResult<PyBoxInfo> {
-        let info = self.handle.info().map_err(map_err)?;
-        Ok(PyBoxInfo::from(info))
+    fn info(&self) -> PyBoxInfo {
+        PyBoxInfo::from(self.handle.info())
     }
 
     #[pyo3(signature = (command, args=None, env=None, tty=false))]
@@ -105,15 +104,6 @@ impl PyBox {
     }
 
     fn __repr__(&self) -> String {
-        let info_str = self
-            .handle
-            .info()
-            .map(|i| format!("{:?}", i))
-            .unwrap_or_else(|_| "<unavailable>".to_string());
-        format!(
-            "Box(id={:?} info={})",
-            self.handle.id().to_string(),
-            info_str
-        )
+        format!("Box(id={:?})", self.handle.id().to_string())
     }
 }

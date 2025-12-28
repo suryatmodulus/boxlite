@@ -10,7 +10,7 @@ use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
 
 use crate::litebox::config::BoxConfig;
-use crate::runtime::types::{BoxID, BoxState, BoxStatus};
+use crate::runtime::types::{BoxID, BoxState};
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 
 use super::{Database, db_err};
@@ -116,47 +116,6 @@ impl BoxStore {
         }
 
         Ok(())
-    }
-
-    /// Update only the status field (convenience method).
-    pub fn update_status(&self, box_id: &str, status: BoxStatus) -> BoxliteResult<()> {
-        let mut state = self
-            .load_state(box_id)?
-            .ok_or_else(|| BoxliteError::NotFound(format!("Box not found: {}", box_id)))?;
-        state.set_status(status);
-        self.update_state(box_id, &state)
-    }
-
-    /// Update only the PID field (convenience method).
-    pub fn update_pid(&self, box_id: &str, pid: Option<u32>) -> BoxliteResult<()> {
-        let mut state = self
-            .load_state(box_id)?
-            .ok_or_else(|| BoxliteError::NotFound(format!("Box not found: {}", box_id)))?;
-        state.set_pid(pid);
-        self.update_state(box_id, &state)
-    }
-
-    /// Update only the container_id field (convenience method).
-    pub fn update_container_id(&self, box_id: &str, container_id: &str) -> BoxliteResult<()> {
-        use crate::runtime::types::ContainerId;
-
-        let mut state = self
-            .load_state(box_id)?
-            .ok_or_else(|| BoxliteError::NotFound(format!("Box not found: {}", box_id)))?;
-        let container_id = ContainerId::parse(container_id).ok_or_else(|| {
-            BoxliteError::Internal(format!("Invalid container ID format: {}", container_id))
-        })?;
-        state.container_id = Some(container_id);
-        self.update_state(box_id, &state)
-    }
-
-    /// Mark box as crashed.
-    pub fn mark_crashed(&self, box_id: &str) -> BoxliteResult<()> {
-        let mut state = self
-            .load_state(box_id)?
-            .ok_or_else(|| BoxliteError::NotFound(format!("Box not found: {}", box_id)))?;
-        state.mark_crashed();
-        self.update_state(box_id, &state)
     }
 
     // ========================================================================
@@ -373,6 +332,8 @@ fn get_boot_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::litebox::config::ContainerRuntimeConfig;
+    use crate::runtime::types::{BoxStatus, ContainerId};
     use crate::vmm::VmmKind;
     use boxlite_shared::Transport;
     use std::path::PathBuf;
@@ -392,10 +353,14 @@ mod tests {
             id: id.to_string(),
             name: None,
             created_at: now,
+            container: ContainerRuntimeConfig {
+                id: ContainerId::new(),
+                image: RootfsSpec::Image("test:latest".to_string()),
+                image_config: None,
+            },
             options: BoxOptions {
                 cpus: Some(2),
                 memory_mib: Some(512),
-                rootfs: RootfsSpec::Image("test:latest".to_string()),
                 ..Default::default()
             },
             engine_kind: VmmKind::Libkrun,
@@ -500,22 +465,6 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_crashed() {
-        let (store, _dir) = create_test_db();
-        let config = create_test_config("test1");
-        let mut state = BoxState::new();
-        state.set_pid(Some(12345));
-        store.save(&config, &state).unwrap();
-
-        store.mark_crashed(&config.id).unwrap();
-
-        let loaded = store.load_state(&config.id).unwrap().unwrap();
-        // mark_crashed() now sets to Stopped (VM rootfs preserved)
-        assert_eq!(loaded.status, BoxStatus::Stopped);
-        assert_eq!(loaded.pid, None);
-    }
-
-    #[test]
     fn test_reboot_detection() {
         let (store, _dir) = create_test_db();
 
@@ -548,19 +497,5 @@ mod tests {
         let loaded = store.load_state(&config.id).unwrap().unwrap();
         assert_eq!(loaded.status, BoxStatus::Stopped);
         assert_eq!(loaded.pid, None);
-    }
-
-    #[test]
-    fn test_update_status() {
-        let (store, _dir) = create_test_db();
-        let config = create_test_config("test1");
-        let state = BoxState::new();
-
-        store.save(&config, &state).unwrap();
-
-        store.update_status(&config.id, BoxStatus::Stopped).unwrap();
-
-        let loaded = store.load_state(&config.id).unwrap().unwrap();
-        assert_eq!(loaded.status, BoxStatus::Stopped);
     }
 }

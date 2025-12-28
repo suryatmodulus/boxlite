@@ -4,23 +4,18 @@ use crate::BoxID;
 use crate::disk::Disk;
 #[cfg(target_os = "linux")]
 use crate::fs::BindMountHandle;
-use crate::images::ContainerConfig;
-use crate::litebox::BoxStatus;
+use crate::images::ContainerImageConfig;
 use crate::litebox::config::BoxConfig;
 use crate::portal::GuestSession;
 use crate::portal::interfaces::ContainerRootfsInitConfig;
-use crate::runtime::guest_rootfs::GuestRootfs;
 use crate::runtime::layout::BoxFilesystemLayout;
-use crate::runtime::options::{BoxOptions, VolumeSpec};
-use crate::runtime::rt_impl::RuntimeInner;
-use crate::runtime::types::{BoxState, ContainerId};
+use crate::runtime::options::VolumeSpec;
+use crate::runtime::rt_impl::SharedRuntimeImpl;
 use crate::vmm::controller::VmmHandler;
 use crate::volumes::{ContainerMount, GuestVolumeManager};
 use boxlite_shared::errors::{BoxliteError, BoxliteResult};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tokio::sync::OnceCell;
 
 /// Switch between merged and overlayfs rootfs strategies.
 /// - true: overlayfs (allows COW writes, keeps layers separate)
@@ -121,7 +116,7 @@ pub enum ContainerRootfsPrepResult {
 /// Automatically cleans up resources and increments failure counter
 /// if dropped without being disarmed.
 pub struct CleanupGuard {
-    runtime: RuntimeInner,
+    runtime: SharedRuntimeImpl,
     box_id: BoxID,
     layout: Option<BoxFilesystemLayout>,
     handler: Option<Box<dyn VmmHandler>>,
@@ -129,7 +124,7 @@ pub struct CleanupGuard {
 }
 
 impl CleanupGuard {
-    pub fn new(runtime: RuntimeInner, box_id: BoxID) -> Self {
+    pub fn new(runtime: SharedRuntimeImpl, box_id: BoxID) -> Self {
         Self {
             runtime,
             box_id,
@@ -185,9 +180,12 @@ impl Drop for CleanupGuard {
         }
 
         // Remove from BoxManager (which handles DB delete via database-first pattern)
-        // First mark as crashed so remove() doesn't fail the active check
-        let _ = self.runtime.box_manager.mark_crashed(&self.box_id);
-        if let Err(e) = self.runtime.box_manager.remove(&self.box_id) {
+        // First mark as crashed so remove_box() doesn't fail the active check
+        if let Ok(mut state) = self.runtime.box_manager.update_box(&self.box_id) {
+            state.mark_crashed();
+            let _ = self.runtime.box_manager.save_box(&self.box_id, &state);
+        }
+        if let Err(e) = self.runtime.box_manager.remove_box(&self.box_id) {
             tracing::warn!("Failed to remove box from manager during cleanup: {}", e);
         }
 
@@ -199,145 +197,55 @@ impl Drop for CleanupGuard {
     }
 }
 
-/// Shared initialization pipeline context.
+/// Initialization pipeline context.
 ///
-/// Stores shared inputs, outputs, and timing across all tasks.
+/// Contains all inputs and outputs for pipeline tasks.
+/// Tasks read from config/runtime and write to Option fields.
 pub struct InitPipelineContext {
     pub config: BoxConfig,
-    pub state: BoxState,
-    pub home_dir: PathBuf,
-    pub runtime: RuntimeInner,
-    pub guest_rootfs_cell: Arc<OnceCell<GuestRootfs>>,
-    pub container_id: ContainerId,
+    pub runtime: SharedRuntimeImpl,
     pub guard: CleanupGuard,
-    pub fs_output: Option<FilesystemOutput>,
-    pub rootfs_output: Option<ContainerRootfsOutput>,
-    pub guest_rootfs_output: Option<GuestRootfsOutput>,
-    pub config_output: Option<ConfigOutput>,
+    pub reuse_rootfs: bool,
+    /// Skip waiting for guest ready signal (for reattach to running box).
+    pub skip_guest_wait: bool,
+
+    pub layout: Option<BoxFilesystemLayout>,
+    pub container_image_config: Option<ContainerImageConfig>,
+    pub container_disk: Option<Disk>,
+    pub guest_disk: Option<Disk>,
+    pub volume_mgr: Option<GuestVolumeManager>,
+    pub rootfs_init: Option<ContainerRootfsInitConfig>,
+    pub container_mounts: Option<Vec<ContainerMount>>,
     pub guest_session: Option<GuestSession>,
-    pub guest_output: Option<GuestOutput>,
-    /// Container config extracted from image (set by VmmSpawnTask for GuestInitTask)
-    pub container_config: Option<ContainerConfig>,
+
+    #[cfg(target_os = "linux")]
+    pub bind_mount: Option<BindMountHandle>,
 }
 
 impl InitPipelineContext {
     pub fn new(
         config: BoxConfig,
-        state: BoxState,
-        home_dir: PathBuf,
-        runtime: RuntimeInner,
-        guest_rootfs_cell: Arc<OnceCell<GuestRootfs>>,
-        container_id: ContainerId,
+        runtime: SharedRuntimeImpl,
+        reuse_rootfs: bool,
+        skip_guest_wait: bool,
     ) -> Self {
         let guard = CleanupGuard::new(runtime.clone(), config.id.clone());
         Self {
             config,
-            state,
-            home_dir,
             runtime,
-            guest_rootfs_cell,
-            container_id,
             guard,
-            fs_output: None,
-            rootfs_output: None,
-            guest_rootfs_output: None,
-            config_output: None,
+            reuse_rootfs,
+            skip_guest_wait,
+            layout: None,
+            container_image_config: None,
+            container_disk: None,
+            guest_disk: None,
+            volume_mgr: None,
+            rootfs_init: None,
+            container_mounts: None,
             guest_session: None,
-            guest_output: None,
-            container_config: None,
+            #[cfg(target_os = "linux")]
+            bind_mount: None,
         }
     }
-
-    pub fn should_reuse_rootfs(&self) -> bool {
-        self.state.status == BoxStatus::Stopped
-    }
-}
-
-// ============================================================================
-// STAGE INPUT/OUTPUT TYPES
-// ============================================================================
-
-/// Input for filesystem stage.
-pub struct FilesystemInput<'a> {
-    pub box_id: &'a BoxID,
-    pub runtime: &'a RuntimeInner,
-    pub isolate_mounts: bool,
-}
-
-/// Output from filesystem stage.
-pub struct FilesystemOutput {
-    pub layout: BoxFilesystemLayout,
-    /// Bind mount handle for mounts/ → shared/ binding (when isolate_mounts is enabled).
-    /// Kept alive for the duration of box lifecycle; cleaned up on drop.
-    #[cfg(target_os = "linux")]
-    pub bind_mount: Option<BindMountHandle>,
-}
-
-/// Input for container rootfs stage.
-pub struct ContainerRootfsInput<'a> {
-    pub options: &'a BoxOptions,
-    pub runtime: &'a RuntimeInner,
-    /// Box filesystem layout (for disk paths)
-    pub layout: &'a BoxFilesystemLayout,
-    /// When true, reuse existing COW disk (for restart).
-    pub reuse_rootfs: bool,
-}
-
-/// Output from container rootfs stage.
-pub struct ContainerRootfsOutput {
-    pub container_config: ContainerConfig,
-    /// COW disk for container rootfs (created or reused on restart)
-    pub disk: Disk,
-}
-
-/// Input for guest rootfs stage.
-pub struct GuestRootfsInput<'a> {
-    pub runtime: &'a RuntimeInner,
-    pub guest_rootfs_cell: &'a Arc<OnceCell<GuestRootfs>>,
-    /// Box filesystem layout (for disk paths)
-    pub layout: &'a BoxFilesystemLayout,
-    /// When true, reuse existing COW disk (for restart).
-    pub reuse_rootfs: bool,
-}
-
-/// Output from guest rootfs stage.
-pub struct GuestRootfsOutput {
-    pub guest_rootfs: GuestRootfs,
-    /// COW disk for guest rootfs (created or reused on restart)
-    pub disk: Option<Disk>,
-}
-
-/// Output from config stage.
-pub struct ConfigOutput {
-    pub box_config: crate::vmm::InstanceSpec,
-    /// Primary disk - in DiskImage mode, this is the rootfs disk (COW overlay of base ext4)
-    pub disk: Disk,
-    /// Init rootfs COW disk (protects shared base from writes)
-    pub init_disk: Option<Disk>,
-    /// Configured volume manager - guest_init calls build_guest_mounts()
-    pub volume_mgr: GuestVolumeManager,
-    /// Rootfs initialization config
-    pub rootfs_init: ContainerRootfsInitConfig,
-    /// Container bind mounts (user volumes)
-    pub container_mounts: Vec<ContainerMount>,
-}
-
-/// Input for guest initialization stage.
-pub struct GuestInput {
-    pub guest_session: GuestSession,
-    pub container_config: ContainerConfig,
-    /// Container ID (generated by host).
-    pub container_id: ContainerId,
-    /// Configured volume manager - builds guest volumes
-    pub volume_mgr: GuestVolumeManager,
-    /// Rootfs initialization config
-    pub rootfs_init: ContainerRootfsInitConfig,
-    /// Container bind mounts (user volumes)
-    pub container_mounts: Vec<ContainerMount>,
-}
-
-/// Output from guest initialization stage.
-pub struct GuestOutput {
-    pub container_id: String,
-    pub guest_session: GuestSession,
 }
