@@ -197,6 +197,7 @@ impl From<JsBoxOptions> for BoxOptions {
             isolate_mounts: false, // Not exposed in JS API yet
             auto_remove: js_opts.auto_remove.unwrap_or(false),
             detach: js_opts.detach.unwrap_or(false),
+            security: Default::default(), // Use default security options
         }
     }
 }

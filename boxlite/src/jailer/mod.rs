@@ -46,7 +46,7 @@
 mod common;
 mod config;
 mod error;
-mod platform;
+pub mod platform;
 
 // Cgroup module (Linux only)
 #[cfg(target_os = "linux")]
