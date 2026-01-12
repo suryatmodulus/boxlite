@@ -84,6 +84,9 @@ jobs:
           run: |
             set -ex
 
+            # Mark directory as safe for git (ownership differs in container)
+            git config --global --add safe.directory /work
+
             # Restore pre-built guest target directory
             GUEST_TARGET=$(scripts/util.sh --target)
             if [ -d ".cache/$GUEST_TARGET" ]; then
