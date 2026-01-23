@@ -6,17 +6,21 @@ Provides common functionality for all specialized boxes (CodeBox, BrowserBox, et
 
 import logging
 from enum import IntEnum
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .exec import ExecResult
 
+if TYPE_CHECKING:
+    from .boxlite import Boxlite
+
 logger = logging.getLogger("boxlite.simplebox")
 
-__all__ = ['SimpleBox']
+__all__ = ["SimpleBox"]
 
 
 class StreamType(IntEnum):
     """Stream type for command execution output."""
+
     STDOUT = 1
     STDERR = 2
 
@@ -36,14 +40,14 @@ class SimpleBox:
     """
 
     def __init__(
-            self,
-            image: str,
-            memory_mib: Optional[int] = None,
-            cpus: Optional[int] = None,
-            runtime: Optional['Boxlite'] = None,
-            name: Optional[str] = None,
-            auto_remove: bool = True,
-            **kwargs
+        self,
+        image: str,
+        memory_mib: Optional[int] = None,
+        cpus: Optional[int] = None,
+        runtime: Optional["Boxlite"] = None,
+        name: Optional[str] = None,
+        auto_remove: bool = True,
+        **kwargs,
     ):
         """
         Create a specialized box.
@@ -80,7 +84,7 @@ class SimpleBox:
             cpus=cpus,
             memory_mib=memory_mib,
             auto_remove=auto_remove,
-            **kwargs
+            **kwargs,
         )
         self._name = name
         self._box = None
@@ -138,10 +142,10 @@ class SimpleBox:
         return self._box.info()
 
     async def exec(
-            self,
-            cmd: str,
-            *args: str,
-            env: Optional[dict[str, str]] = None,
+        self,
+        cmd: str,
+        *args: str,
+        env: Optional[dict[str, str]] = None,
     ) -> ExecResult:
         """
         Execute a command in the box and return the result.
@@ -203,7 +207,7 @@ class SimpleBox:
             try:
                 async for line in stdout:
                     if isinstance(line, bytes):
-                        stdout_lines.append(line.decode('utf-8', errors='replace'))
+                        stdout_lines.append(line.decode("utf-8", errors="replace"))
                     else:
                         stdout_lines.append(line)
             except Exception as e:
@@ -216,7 +220,7 @@ class SimpleBox:
             try:
                 async for line in stderr:
                     if isinstance(line, bytes):
-                        stderr_lines.append(line.decode('utf-8', errors='replace'))
+                        stderr_lines.append(line.decode("utf-8", errors="replace"))
                     else:
                         stderr_lines.append(line)
             except Exception as e:
@@ -224,8 +228,8 @@ class SimpleBox:
                 pass
 
         # Combine lines
-        stdout = ''.join(stdout_lines)
-        stderr = ''.join(stderr_lines)
+        stdout = "".join(stdout_lines)
+        stderr = "".join(stderr_lines)
 
         try:
             exec_result = await execution.wait()
