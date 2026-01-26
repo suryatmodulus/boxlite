@@ -85,6 +85,13 @@ try:
 except ImportError:
     pass
 
+try:
+    from .skillbox import SkillBox  # noqa: F401
+
+    __all__.extend(["SkillBox"])
+except ImportError:
+    pass
+
 # Sync API (greenlet-based synchronous wrappers, re-exported via __all__)
 # Requires greenlet: pip install boxlite[sync]
 try:
@@ -96,6 +103,7 @@ try:
         SyncExecStderr,
         SyncSimpleBox,
         SyncCodeBox,
+        SyncSkillBox,
     )
 
     __all__.extend(
@@ -107,6 +115,7 @@ try:
             "SyncExecStderr",
             "SyncSimpleBox",
             "SyncCodeBox",
+            "SyncSkillBox",
         ]
     )
 except ImportError:

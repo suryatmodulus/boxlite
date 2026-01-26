@@ -91,13 +91,27 @@ class SimpleBox:
         self._started = False
 
     async def __aenter__(self):
-        """Async context manager entry - creates and starts the box.
+        """Async context manager entry - creates or reuses an existing box.
 
         This method is idempotent - calling it multiple times is safe.
         All initialization logic lives here; start() is just an alias.
+
+        When a name is provided, attempts to get an existing box first.
+        This enables persistence across sessions with auto_remove=False.
         """
         if self._started:
             return self
+
+        # Try to get existing box by name (enables persistence)
+        if self._name:
+            self._box = await self._runtime.get(self._name)
+            if self._box:
+                logger.debug("Reusing existing box: %s", self._name)
+                await self._box.__aenter__()
+                self._started = True
+                return self
+
+        # Create new box
         self._box = await self._runtime.create(self._box_options, name=self._name)
         await self._box.__aenter__()
         self._started = True
